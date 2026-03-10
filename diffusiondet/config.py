@@ -14,6 +14,8 @@ def add_diffusiondet_config(cfg):
     """
     cfg.MODEL.DiffusionDet = CN()
     cfg.MODEL.DiffusionDet.NUM_CLASSES = 80
+    cfg.MODEL.DiffusionDet.NUM_CLASSES_PATHO = 4
+    cfg.MODEL.DiffusionDet.NUM_CLASSES_JAW = 2
     cfg.MODEL.DiffusionDet.NUM_PROPOSALS = 300
 
     # RCNN Head.
@@ -32,6 +34,8 @@ def add_diffusiondet_config(cfg):
 
     # Loss.
     cfg.MODEL.DiffusionDet.CLASS_WEIGHT = 2.0
+    cfg.MODEL.DiffusionDet.PATHO_WEIGHT = 2.0
+    cfg.MODEL.DiffusionDet.JAW_WEIGHT = 2.0
     cfg.MODEL.DiffusionDet.GIOU_WEIGHT = 2.0
     cfg.MODEL.DiffusionDet.L1_WEIGHT = 5.0
     cfg.MODEL.DiffusionDet.DEEP_SUPERVISION = True

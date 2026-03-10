@@ -24,7 +24,7 @@ class SetCriterionDynamicK(nn.Module):
         1) we compute hungarian assignment between ground truth boxes and the outputs of the model
         2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
-    def __init__(self, cfg, num_classes, matcher, weight_dict, eos_coef, losses, use_focal):
+    def __init__(self, cfg, num_classes, num_classes_patho, num_classes_jaw, matcher, weight_dict, eos_coef, losses, use_focal):
         """ Create the criterion.
         Parameters:
             num_classes: number of object categories, omitting the special no-object category
@@ -36,6 +36,8 @@ class SetCriterionDynamicK(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.num_classes = num_classes
+        self.num_classes_patho = num_classes_patho
+        self.num_classes_jaw = num_classes_jaw
         self.matcher = matcher
         self.weight_dict = weight_dict
         self.eos_coef = eos_coef
@@ -118,39 +120,65 @@ class SetCriterionDynamicK(nn.Module):
         if self.use_focal or self.use_fed_loss:
             num_boxes = torch.cat(target_classes_o_list).shape[0] if len(target_classes_o_list) != 0 else 1
 
+            # Task 1: Tooth Number
             target_classes_onehot = torch.zeros([src_logits.shape[0], src_logits.shape[1], self.num_classes + 1],
                                                 dtype=src_logits.dtype, layout=src_logits.layout,
                                                 device=src_logits.device)
             target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
-
-            gt_classes = torch.argmax(target_classes_onehot, dim=-1)
             target_classes_onehot = target_classes_onehot[:, :, :-1]
-
-            src_logits = src_logits.flatten(0, 1)
+            src_logits_flat = src_logits.flatten(0, 1)
             target_classes_onehot = target_classes_onehot.flatten(0, 1)
             if self.use_focal:
-                cls_loss = sigmoid_focal_loss_jit(src_logits, target_classes_onehot, alpha=self.focal_loss_alpha, gamma=self.focal_loss_gamma, reduction="none")
+                cls_loss = sigmoid_focal_loss_jit(src_logits_flat, target_classes_onehot, alpha=self.focal_loss_alpha, gamma=self.focal_loss_gamma, reduction="none")
             else:
-                cls_loss = F.binary_cross_entropy_with_logits(src_logits, target_classes_onehot, reduction="none")
-            if self.use_fed_loss:
-                K = self.num_classes
-                N = src_logits.shape[0]
-                fed_loss_classes = self.get_fed_loss_classes(
-                    gt_classes,
-                    num_fed_loss_classes=self.fed_loss_num_classes,
-                    num_classes=K,
-                    weight=self.fed_loss_cls_weights,
-                )
-                fed_loss_classes_mask = fed_loss_classes.new_zeros(K + 1)
-                fed_loss_classes_mask[fed_loss_classes] = 1
-                fed_loss_classes_mask = fed_loss_classes_mask[:K]
-                weight = fed_loss_classes_mask.view(1, K).expand(N, K).float()
+                cls_loss = F.binary_cross_entropy_with_logits(src_logits_flat, target_classes_onehot, reduction="none")
+            loss_ce = torch.sum(cls_loss) / num_boxes
 
-                loss_ce = torch.sum(cls_loss * weight) / num_boxes
-            else:
-                loss_ce = torch.sum(cls_loss) / num_boxes
+            # Task 2: Pathological Diagnosis
+            loss_patho = torch.zeros_like(loss_ce)
+            if 'pred_patho_logits' in outputs:
+                src_patho_logits = outputs['pred_patho_logits']
+                target_patho = torch.full(src_patho_logits.shape[:2], self.num_classes_patho, dtype=torch.int64, device=src_patho_logits.device)
+                for batch_idx in range(batch_size):
+                    valid_query = indices[batch_idx][0]
+                    gt_multi_idx = indices[batch_idx][1]
+                    if len(gt_multi_idx) == 0: continue
+                    target_patho_o = targets[batch_idx]["labels_patho"]
+                    target_patho[batch_idx, valid_query] = target_patho_o[gt_multi_idx]
+                
+                target_patho_onehot = torch.zeros([src_patho_logits.shape[0], src_patho_logits.shape[1], self.num_classes_patho + 1], dtype=src_patho_logits.dtype, device=src_patho_logits.device)
+                target_patho_onehot.scatter_(2, target_patho.unsqueeze(-1), 1)
+                target_patho_onehot = target_patho_onehot[:, :, :-1].flatten(0, 1)
+                src_patho_logits_flat = src_patho_logits.flatten(0, 1)
+                if self.use_focal:
+                    patho_loss = sigmoid_focal_loss_jit(src_patho_logits_flat, target_patho_onehot, alpha=self.focal_loss_alpha, gamma=self.focal_loss_gamma, reduction="none")
+                else:
+                    patho_loss = F.binary_cross_entropy_with_logits(src_patho_logits_flat, target_patho_onehot, reduction="none")
+                loss_patho = torch.sum(patho_loss) / num_boxes
 
-            losses = {'loss_ce': loss_ce}
+            # Task 3: Jaw Area
+            loss_jaw = torch.zeros_like(loss_ce)
+            if 'pred_jaw_logits' in outputs:
+                src_jaw_logits = outputs['pred_jaw_logits']
+                target_jaw = torch.full(src_jaw_logits.shape[:2], self.num_classes_jaw, dtype=torch.int64, device=src_jaw_logits.device)
+                for batch_idx in range(batch_size):
+                    valid_query = indices[batch_idx][0]
+                    gt_multi_idx = indices[batch_idx][1]
+                    if len(gt_multi_idx) == 0: continue
+                    target_jaw_o = targets[batch_idx]["labels_jaw"]
+                    target_jaw[batch_idx, valid_query] = target_jaw_o[gt_multi_idx]
+                
+                target_jaw_onehot = torch.zeros([src_jaw_logits.shape[0], src_jaw_logits.shape[1], self.num_classes_jaw + 1], dtype=src_jaw_logits.dtype, device=src_jaw_logits.device)
+                target_jaw_onehot.scatter_(2, target_jaw.unsqueeze(-1), 1)
+                target_jaw_onehot = target_jaw_onehot[:, :, :-1].flatten(0, 1)
+                src_jaw_logits_flat = src_jaw_logits.flatten(0, 1)
+                if self.use_focal:
+                    jaw_loss = sigmoid_focal_loss_jit(src_jaw_logits_flat, target_jaw_onehot, alpha=self.focal_loss_alpha, gamma=self.focal_loss_gamma, reduction="none")
+                else:
+                    jaw_loss = F.binary_cross_entropy_with_logits(src_jaw_logits_flat, target_jaw_onehot, reduction="none")
+                loss_jaw = torch.sum(jaw_loss) / num_boxes
+
+            losses = {'loss_ce': loss_ce, 'loss_patho': loss_patho, 'loss_jaw': loss_jaw}
         else:
             raise NotImplementedError
 
@@ -274,15 +302,19 @@ class HungarianMatcherDynamicK(nn.Module):
     there are more predictions than targets. In this case, we do a 1-to-k (dynamic) matching of the best predictions,
     while the others are un-matched (and thus treated as non-objects).
     """
-    def __init__(self, cfg, cost_class: float = 1, cost_bbox: float = 1, cost_giou: float = 1, cost_mask: float = 1, use_focal: bool = False):
+    def __init__(self, cfg, cost_class: float = 1, cost_patho: float = 1, cost_jaw: float = 1, cost_bbox: float = 1, cost_giou: float = 1, cost_mask: float = 1, use_focal: bool = False):
         """Creates the matcher
         Params:
             cost_class: This is the relative weight of the classification error in the matching cost
+            cost_patho: Weight for pathological diagnosis classification cost
+            cost_jaw: Weight for jaw area classification cost
             cost_bbox: This is the relative weight of the L1 error of the bounding box coordinates in the matching cost
             cost_giou: This is the relative weight of the giou loss of the bounding box in the matching cost
         """
         super().__init__()
         self.cost_class = cost_class
+        self.cost_patho = cost_patho
+        self.cost_jaw = cost_jaw
         self.cost_bbox = cost_bbox
         self.cost_giou = cost_giou
         self.use_focal = use_focal
@@ -335,16 +367,35 @@ class HungarianMatcherDynamicK(nn.Module):
                 if self.use_focal:
                     alpha = self.focal_loss_alpha
                     gamma = self.focal_loss_gamma
+                    
+                    # Tooth Number cost
                     neg_cost_class = (1 - alpha) * (bz_out_prob ** gamma) * (-(1 - bz_out_prob + 1e-8).log())
                     pos_cost_class = alpha * ((1 - bz_out_prob) ** gamma) * (-(bz_out_prob + 1e-8).log())
                     cost_class = pos_cost_class[:, bz_tgt_ids] - neg_cost_class[:, bz_tgt_ids]
-                elif self.use_fed_loss:
-                    # focal loss degenerates to naive one
-                    neg_cost_class = (-(1 - bz_out_prob + 1e-8).log())
-                    pos_cost_class = (-(bz_out_prob + 1e-8).log())
-                    cost_class = pos_cost_class[:, bz_tgt_ids] - neg_cost_class[:, bz_tgt_ids]
+                    
+                    # Pathological Diagnosis cost
+                    if "pred_patho_logits" in outputs:
+                        bz_out_patho = outputs["pred_patho_logits"][batch_idx].sigmoid()
+                        bz_tgt_patho = targets[batch_idx]["labels_patho"]
+                        neg_cost_patho = (1 - alpha) * (bz_out_patho ** gamma) * (-(1 - bz_out_patho + 1e-8).log())
+                        pos_cost_patho = alpha * ((1 - bz_out_patho) ** gamma) * (-(bz_out_patho + 1e-8).log())
+                        cost_patho = pos_cost_patho[:, bz_tgt_patho] - neg_cost_patho[:, bz_tgt_patho]
+                    else:
+                        cost_patho = 0
+
+                    # Jaw Area cost
+                    if "pred_jaw_logits" in outputs:
+                        bz_out_jaw = outputs["pred_jaw_logits"][batch_idx].sigmoid()
+                        bz_tgt_jaw = targets[batch_idx]["labels_jaw"]
+                        neg_cost_jaw = (1 - alpha) * (bz_out_jaw ** gamma) * (-(1 - bz_out_jaw + 1e-8).log())
+                        pos_cost_jaw = alpha * ((1 - bz_out_jaw) ** gamma) * (-(bz_out_jaw + 1e-8).log())
+                        cost_jaw = pos_cost_jaw[:, bz_tgt_jaw] - neg_cost_jaw[:, bz_tgt_jaw]
+                    else:
+                        cost_jaw = 0
                 else:
                     cost_class = -bz_out_prob[:, bz_tgt_ids]
+                    cost_patho = 0 # Not implemented for non-focal
+                    cost_jaw = 0
 
                 # Compute the L1 cost between boxes
                 # image_size_out = torch.cat([v["image_size_xyxy"].unsqueeze(0) for v in targets])
@@ -361,7 +412,9 @@ class HungarianMatcherDynamicK(nn.Module):
                 cost_giou = -generalized_box_iou(bz_boxes, bz_gtboxs_abs_xyxy)
 
                 # Final cost matrix
-                cost = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou + 100.0 * (~is_in_boxes_and_center)
+                cost = self.cost_bbox * cost_bbox + self.cost_class * cost_class + \
+                       self.cost_patho * cost_patho + self.cost_jaw * cost_jaw + \
+                       self.cost_giou * cost_giou + 100.0 * (~is_in_boxes_and_center)
                 # cost = (cost_class + 3.0 * cost_giou + 100.0 * (~is_in_boxes_and_center))  # [num_query,num_gt]
                 cost[~fg_mask] = cost[~fg_mask] + 10000.0
 

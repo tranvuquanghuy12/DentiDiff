@@ -67,7 +67,33 @@ class VisualizationDemo(object):
                 )
             if "instances" in predictions:
                 instances = predictions["instances"].to(self.cpu_device)
-                vis_output = visualizer.draw_instance_predictions(predictions=instances)
+                
+                # Custom labels to include Patho and Jaw information
+                labels = []
+                for i in range(len(instances)):
+                    # Get the base class name (Tooth Number)
+                    class_id = instances.pred_classes[i].item()
+                    label = self.metadata.thing_classes[class_id]
+                    
+                    # Append Patho info if exists
+                    if hasattr(instances, "pred_patho"):
+                        patho_id = instances.pred_patho[i].item()
+                        label += f" | P:{patho_id}"
+                    
+                    # Append Jaw info if exists
+                    if hasattr(instances, "pred_jaw"):
+                        jaw_id = instances.pred_jaw[i].item()
+                        label += f" | J:{jaw_id}"
+                    
+                    labels.append(label)
+
+                vis_output = visualizer.overlay_instances(
+                    labels=labels,
+                    boxes=instances.pred_boxes,
+                    masks=instances.pred_masks if instances.has("pred_masks") else None,
+                    assigned_colors=None,
+                    alpha=0.5
+                )
 
         return predictions, vis_output
 

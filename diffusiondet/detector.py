@@ -72,6 +72,8 @@ class DiffusionDet(nn.Module):
 
         self.in_features = cfg.MODEL.ROI_HEADS.IN_FEATURES
         self.num_classes = cfg.MODEL.DiffusionDet.NUM_CLASSES
+        self.num_classes_patho = cfg.MODEL.DiffusionDet.NUM_CLASSES_PATHO
+        self.num_classes_jaw = cfg.MODEL.DiffusionDet.NUM_CLASSES_JAW
         self.num_proposals = cfg.MODEL.DiffusionDet.NUM_PROPOSALS
         self.hidden_dim = cfg.MODEL.DiffusionDet.HIDDEN_DIM
         self.num_heads = cfg.MODEL.DiffusionDet.NUM_HEADS
@@ -131,6 +133,8 @@ class DiffusionDet(nn.Module):
         self.head = DynamicHead(cfg=cfg, roi_input_shape=self.backbone.output_shape())
         # Loss parameters:
         class_weight = cfg.MODEL.DiffusionDet.CLASS_WEIGHT
+        patho_weight = cfg.MODEL.DiffusionDet.PATHO_WEIGHT
+        jaw_weight = cfg.MODEL.DiffusionDet.JAW_WEIGHT
         giou_weight = cfg.MODEL.DiffusionDet.GIOU_WEIGHT
         l1_weight = cfg.MODEL.DiffusionDet.L1_WEIGHT
         no_object_weight = cfg.MODEL.DiffusionDet.NO_OBJECT_WEIGHT
@@ -141,9 +145,9 @@ class DiffusionDet(nn.Module):
 
         # Build Criterion.
         matcher = HungarianMatcherDynamicK(
-            cfg=cfg, cost_class=class_weight, cost_bbox=l1_weight, cost_giou=giou_weight, use_focal=self.use_focal
+            cfg=cfg, cost_class=class_weight, cost_patho=patho_weight, cost_jaw=jaw_weight, cost_bbox=l1_weight, cost_giou=giou_weight, use_focal=self.use_focal
         )
-        weight_dict = {"loss_ce": class_weight, "loss_bbox": l1_weight, "loss_giou": giou_weight}
+        weight_dict = {"loss_ce": class_weight, "loss_patho": patho_weight, "loss_jaw": jaw_weight, "loss_bbox": l1_weight, "loss_giou": giou_weight}
         if self.deep_supervision:
             aux_weight_dict = {}
             for i in range(self.num_heads - 1):
@@ -153,7 +157,8 @@ class DiffusionDet(nn.Module):
         losses = ["labels", "boxes"]
 
         self.criterion = SetCriterionDynamicK(
-            cfg=cfg, num_classes=self.num_classes, matcher=matcher, weight_dict=weight_dict, eos_coef=no_object_weight,
+            cfg=cfg, num_classes=self.num_classes, num_classes_patho=self.num_classes_patho, num_classes_jaw=self.num_classes_jaw, 
+            matcher=matcher, weight_dict=weight_dict, eos_coef=no_object_weight,
             losses=losses, use_focal=self.use_focal,)
 
         pixel_mean = torch.Tensor(cfg.MODEL.PIXEL_MEAN).to(self.device).view(3, 1, 1)
@@ -172,7 +177,7 @@ class DiffusionDet(nn.Module):
         x_boxes = ((x_boxes / self.scale) + 1) / 2
         x_boxes = box_cxcywh_to_xyxy(x_boxes)
         x_boxes = x_boxes * images_whwh[:, None, :]
-        outputs_class, outputs_coord = self.head(backbone_feats, x_boxes, t, None)
+        outputs_class, outputs_patho, outputs_jaw, outputs_coord = self.head(backbone_feats, x_boxes, t, None)
 
         x_start = outputs_coord[-1]  # (batch, num_proposals, 4) predict boxes: absolute coordinates (x1, y1, x2, y2)
         x_start = x_start / images_whwh[:, None, :]
@@ -181,7 +186,7 @@ class DiffusionDet(nn.Module):
         x_start = torch.clamp(x_start, min=-1 * self.scale, max=self.scale)
         pred_noise = self.predict_noise_from_start(x, t, x_start)
 
-        return ModelPrediction(pred_noise, x_start), outputs_class, outputs_coord
+        return ModelPrediction(pred_noise, x_start), outputs_class, outputs_patho, outputs_jaw, outputs_coord
 
     @torch.no_grad()
     def ddim_sample(self, batched_inputs, backbone_feats, images_whwh, images, clip_denoised=True, do_postprocess=True):
@@ -202,8 +207,8 @@ class DiffusionDet(nn.Module):
             time_cond = torch.full((batch,), time, device=self.device, dtype=torch.long)
             self_cond = x_start if self.self_condition else None
 
-            preds, outputs_class, outputs_coord = self.model_predictions(backbone_feats, images_whwh, img, time_cond,
-                                                                         self_cond, clip_x_start=clip_denoised)
+            preds, outputs_class, outputs_patho, outputs_jaw, outputs_coord = self.model_predictions(backbone_feats, images_whwh, img, time_cond,
+                                                                          self_cond, clip_x_start=clip_denoised)
             pred_noise, x_start = preds.pred_noise, preds.pred_x_start
 
             if self.box_renewal:  # filter
@@ -237,9 +242,11 @@ class DiffusionDet(nn.Module):
                 # replenish with randn boxes
                 img = torch.cat((img, torch.randn(1, self.num_proposals - num_remain, 4, device=img.device)), dim=1)
             if self.use_ensemble and self.sampling_timesteps > 1:
-                box_pred_per_image, scores_per_image, labels_per_image = self.inference(outputs_class[-1],
-                                                                                        outputs_coord[-1],
-                                                                                        images.image_sizes)
+                box_pred_per_image, scores_per_image, labels_per_image, patho_per_image, jaw_per_image = self.inference(outputs_class[-1],
+                                                                                         outputs_patho[-1],
+                                                                                         outputs_jaw[-1],
+                                                                                         outputs_coord[-1],
+                                                                                         images.image_sizes)
                 ensemble_score.append(scores_per_image)
                 ensemble_label.append(labels_per_image)
                 ensemble_coord.append(box_pred_per_image)
@@ -258,12 +265,11 @@ class DiffusionDet(nn.Module):
             result.pred_boxes = Boxes(box_pred_per_image)
             result.scores = scores_per_image
             result.pred_classes = labels_per_image
+            # Note: ensemble for patho and jaw not implemented here, but can be added similarly
             results = [result]
         else:
-            output = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
-            box_cls = output["pred_logits"]
-            box_pred = output["pred_boxes"]
-            results = self.inference(box_cls, box_pred, images.image_sizes)
+            output = {'pred_logits': outputs_class[-1], 'pred_patho_logits': outputs_patho[-1], 'pred_jaw_logits': outputs_jaw[-1], 'pred_boxes': outputs_coord[-1]}
+            results = self.inference(output['pred_logits'], output['pred_patho_logits'], output['pred_jaw_logits'], output['pred_boxes'], images.image_sizes)
         if do_postprocess:
             processed_results = []
             for results_per_image, input_per_image, image_size in zip(results, batched_inputs, images.image_sizes):
@@ -320,12 +326,12 @@ class DiffusionDet(nn.Module):
             t = t.squeeze(-1)
             x_boxes = x_boxes * images_whwh[:, None, :]
 
-            outputs_class, outputs_coord = self.head(features, x_boxes, t, None)
-            output = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
+            outputs_class, outputs_patho, outputs_jaw, outputs_coord = self.head(features, x_boxes, t, None)
+            output = {'pred_logits': outputs_class[-1], 'pred_patho_logits': outputs_patho[-1], 'pred_jaw_logits': outputs_jaw[-1], 'pred_boxes': outputs_coord[-1]}
 
             if self.deep_supervision:
-                output['aux_outputs'] = [{'pred_logits': a, 'pred_boxes': b}
-                                         for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+                output['aux_outputs'] = [{'pred_logits': a, 'pred_patho_logits': ap, 'pred_jaw_logits': aj, 'pred_boxes': b}
+                                         for a, ap, aj, b in zip(outputs_class[:-1], outputs_patho[:-1], outputs_jaw[:-1], outputs_coord[:-1])]
 
             loss_dict = self.criterion(output, targets)
             weight_dict = self.criterion.weight_dict
@@ -421,6 +427,15 @@ class DiffusionDet(nn.Module):
             noises.append(d_noise)
             ts.append(d_t)
             target["labels"] = gt_classes.to(self.device)
+            if hasattr(targets_per_image, "gt_patho"):
+                target["labels_patho"] = targets_per_image.gt_patho.to(self.device)
+            else:
+                target["labels_patho"] = torch.zeros_like(gt_classes).to(self.device)
+            if hasattr(targets_per_image, "gt_jaw"):
+                target["labels_jaw"] = targets_per_image.gt_jaw.to(self.device)
+            else:
+                target["labels_jaw"] = torch.zeros_like(gt_classes).to(self.device)
+            
             target["boxes"] = gt_boxes.to(self.device)
             target["boxes_xyxy"] = targets_per_image.gt_boxes.tensor.to(self.device)
             target["image_size_xyxy"] = image_size_xyxy.to(self.device)
@@ -431,11 +446,12 @@ class DiffusionDet(nn.Module):
 
         return new_targets, torch.stack(diffused_boxes), torch.stack(noises), torch.stack(ts)
 
-    def inference(self, box_cls, box_pred, image_sizes):
+    def inference(self, box_cls, box_patho, box_jaw, box_pred, image_sizes):
         """
         Arguments:
-            box_cls (Tensor): tensor of shape (batch_size, num_proposals, K).
-                The tensor predicts the classification probability for each proposal.
+            box_cls (Tensor): tensor of shape (batch_size, num_proposals, K1).
+            box_patho (Tensor): tensor of shape (batch_size, num_proposals, K2).
+            box_jaw (Tensor): tensor of shape (batch_size, num_proposals, K3).
             box_pred (Tensor): tensors of shape (batch_size, num_proposals, 4).
                 The tensor predicts 4-vector (x,y,w,h) box
                 regression values for every proposal
@@ -458,42 +474,59 @@ class DiffusionDet(nn.Module):
                 result = Instances(image_size)
                 scores_per_image, topk_indices = scores_per_image.flatten(0, 1).topk(self.num_proposals, sorted=False)
                 labels_per_image = labels[topk_indices]
+                
+                patho_scores = torch.sigmoid(box_patho[i])
+                patho_labels = patho_scores.argmax(-1).flatten(0)[topk_indices // self.num_classes]
+
+                jaw_scores = torch.sigmoid(box_jaw[i])
+                jaw_labels = jaw_scores.argmax(-1).flatten(0)[topk_indices // self.num_classes]
+
                 box_pred_per_image = box_pred_per_image.view(-1, 1, 4).repeat(1, self.num_classes, 1).view(-1, 4)
                 box_pred_per_image = box_pred_per_image[topk_indices]
 
                 if self.use_ensemble and self.sampling_timesteps > 1:
-                    return box_pred_per_image, scores_per_image, labels_per_image
+                    return box_pred_per_image, scores_per_image, labels_per_image, patho_labels, jaw_labels
 
                 if self.use_nms:
                     keep = batched_nms(box_pred_per_image, scores_per_image, labels_per_image, 0.5)
                     box_pred_per_image = box_pred_per_image[keep]
                     scores_per_image = scores_per_image[keep]
                     labels_per_image = labels_per_image[keep]
+                    patho_labels = patho_labels[keep]
+                    jaw_labels = jaw_labels[keep]
 
                 result.pred_boxes = Boxes(box_pred_per_image)
                 result.scores = scores_per_image
                 result.pred_classes = labels_per_image
+                result.pred_patho = patho_labels
+                result.pred_jaw = jaw_labels
                 results.append(result)
 
         else:
             # For each box we assign the best class or the second best if the best on is `no_object`.
             scores, labels = F.softmax(box_cls, dim=-1)[:, :, :-1].max(-1)
+            patho_labels = F.softmax(box_patho, dim=-1)[:, :, :-1].argmax(-1)
+            jaw_labels = F.softmax(box_jaw, dim=-1)[:, :, :-1].argmax(-1)
 
-            for i, (scores_per_image, labels_per_image, box_pred_per_image, image_size) in enumerate(zip(
-                    scores, labels, box_pred, image_sizes
+            for i, (scores_per_image, labels_per_image, patho_labels_per_image, jaw_labels_per_image, box_pred_per_image, image_size) in enumerate(zip(
+                    scores, labels, patho_labels, jaw_labels, box_pred, image_sizes
             )):
                 if self.use_ensemble and self.sampling_timesteps > 1:
-                    return box_pred_per_image, scores_per_image, labels_per_image
+                    return box_pred_per_image, scores_per_image, labels_per_image, patho_labels_per_image, jaw_labels_per_image
 
                 if self.use_nms:
                     keep = batched_nms(box_pred_per_image, scores_per_image, labels_per_image, 0.5)
                     box_pred_per_image = box_pred_per_image[keep]
                     scores_per_image = scores_per_image[keep]
                     labels_per_image = labels_per_image[keep]
+                    patho_labels_per_image = patho_labels_per_image[keep]
+                    jaw_labels_per_image = jaw_labels_per_image[keep]
                 result = Instances(image_size)
                 result.pred_boxes = Boxes(box_pred_per_image)
                 result.scores = scores_per_image
                 result.pred_classes = labels_per_image
+                result.pred_patho = patho_labels_per_image
+                result.pred_jaw = jaw_labels_per_image
                 results.append(result)
 
         return results

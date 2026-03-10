@@ -79,13 +79,16 @@ class DynamicHead(nn.Module):
         
         # Build heads.
         num_classes = cfg.MODEL.DiffusionDet.NUM_CLASSES
+        num_classes_patho = cfg.MODEL.DiffusionDet.NUM_CLASSES_PATHO
+        num_classes_jaw = cfg.MODEL.DiffusionDet.NUM_CLASSES_JAW
+
         d_model = cfg.MODEL.DiffusionDet.HIDDEN_DIM
         dim_feedforward = cfg.MODEL.DiffusionDet.DIM_FEEDFORWARD
         nhead = cfg.MODEL.DiffusionDet.NHEADS
         dropout = cfg.MODEL.DiffusionDet.DROPOUT
         activation = cfg.MODEL.DiffusionDet.ACTIVATION
         num_heads = cfg.MODEL.DiffusionDet.NUM_HEADS
-        rcnn_head = RCNNHead(cfg, d_model, num_classes, dim_feedforward, nhead, dropout, activation)
+        rcnn_head = RCNNHead(cfg, d_model, num_classes, num_classes_patho, num_classes_jaw, dim_feedforward, nhead, dropout, activation)
         self.head_series = _get_clones(rcnn_head, num_heads)
         self.num_heads = num_heads
         self.return_intermediate = cfg.MODEL.DiffusionDet.DEEP_SUPERVISION
@@ -104,6 +107,8 @@ class DynamicHead(nn.Module):
         self.use_focal = cfg.MODEL.DiffusionDet.USE_FOCAL
         self.use_fed_loss = cfg.MODEL.DiffusionDet.USE_FED_LOSS
         self.num_classes = num_classes
+        self.num_classes_patho = num_classes_patho
+        self.num_classes_jaw = num_classes_jaw
         if self.use_focal or self.use_fed_loss:
             prior_prob = cfg.MODEL.DiffusionDet.PRIOR_PROB
             self.bias_value = -math.log((1 - prior_prob) / prior_prob)
@@ -117,7 +122,7 @@ class DynamicHead(nn.Module):
 
             # initialize the bias for focal loss and fed loss.
             if self.use_focal or self.use_fed_loss:
-                if p.shape[-1] == self.num_classes or p.shape[-1] == self.num_classes + 1:
+                if p.shape[-1] in [self.num_classes, self.num_classes + 1, self.num_classes_patho, self.num_classes_patho + 1, self.num_classes_jaw, self.num_classes_jaw + 1]:
                     nn.init.constant_(p, self.bias_value)
 
     @staticmethod
@@ -148,6 +153,8 @@ class DynamicHead(nn.Module):
         time = self.time_mlp(t)
 
         inter_class_logits = []
+        inter_class_patho_logits = []
+        inter_class_jaw_logits = []
         inter_pred_bboxes = []
 
         bs = len(features[0])
@@ -161,21 +168,23 @@ class DynamicHead(nn.Module):
             proposal_features = None
         
         for head_idx, rcnn_head in enumerate(self.head_series):
-            class_logits, pred_bboxes, proposal_features = rcnn_head(features, bboxes, proposal_features, self.box_pooler, time)
+            class_logits, class_patho_logits, class_jaw_logits, pred_bboxes, proposal_features = rcnn_head(features, bboxes, proposal_features, self.box_pooler, time)
             if self.return_intermediate:
                 inter_class_logits.append(class_logits)
+                inter_class_patho_logits.append(class_patho_logits)
+                inter_class_jaw_logits.append(class_jaw_logits)
                 inter_pred_bboxes.append(pred_bboxes)
             bboxes = pred_bboxes.detach()
 
         if self.return_intermediate:
-            return torch.stack(inter_class_logits), torch.stack(inter_pred_bboxes)
+            return torch.stack(inter_class_logits), torch.stack(inter_class_patho_logits), torch.stack(inter_class_jaw_logits), torch.stack(inter_pred_bboxes)
 
-        return class_logits[None], pred_bboxes[None]
+        return class_logits[None], class_patho_logits[None], class_jaw_logits[None], pred_bboxes[None]
 
 
 class RCNNHead(nn.Module):
 
-    def __init__(self, cfg, d_model, num_classes, dim_feedforward=2048, nhead=8, dropout=0.1, activation="relu",
+    def __init__(self, cfg, d_model, num_classes, num_classes_patho, num_classes_jaw, dim_feedforward=2048, nhead=8, dropout=0.1, activation="relu",
                  scale_clamp: float = _DEFAULT_SCALE_CLAMP, bbox_weights=(2.0, 2.0, 1.0, 1.0)):
         super().__init__()
 
@@ -210,6 +219,10 @@ class RCNNHead(nn.Module):
             cls_module.append(nn.ReLU(inplace=True))
         self.cls_module = nn.ModuleList(cls_module)
 
+        # Hierarchical layers
+        self.jaw_to_tooth = nn.Linear(num_classes_jaw, d_model)
+        self.tooth_jaw_to_patho = nn.Linear(num_classes + num_classes_jaw, d_model)
+
         # reg.
         num_reg = cfg.MODEL.DiffusionDet.NUM_REG
         reg_module = list()
@@ -224,8 +237,12 @@ class RCNNHead(nn.Module):
         self.use_fed_loss = cfg.MODEL.DiffusionDet.USE_FED_LOSS
         if self.use_focal or self.use_fed_loss:
             self.class_logits = nn.Linear(d_model, num_classes)
+            self.class_patho_logits = nn.Linear(d_model, num_classes_patho)
+            self.class_jaw_logits = nn.Linear(d_model, num_classes_jaw)
         else:
             self.class_logits = nn.Linear(d_model, num_classes + 1)
+            self.class_patho_logits = nn.Linear(d_model, num_classes_patho + 1)
+            self.class_jaw_logits = nn.Linear(d_model, num_classes_jaw + 1)
         self.bboxes_delta = nn.Linear(d_model, 4)
         self.scale_clamp = scale_clamp
         self.bbox_weights = bbox_weights
@@ -273,17 +290,31 @@ class RCNNHead(nn.Module):
         scale, shift = scale_shift.chunk(2, dim=1)
         fc_feature = fc_feature * (scale + 1) + shift
 
+        # Feature processing for classification and regression
         cls_feature = fc_feature.clone()
         reg_feature = fc_feature.clone()
         for cls_layer in self.cls_module:
             cls_feature = cls_layer(cls_feature)
         for reg_layer in self.reg_module:
             reg_feature = reg_layer(reg_feature)
-        class_logits = self.class_logits(cls_feature)
+
+        # Hierarchical Prediction: Jaw -> Tooth -> Patho
+        # 1. Prediction Jaw Area
+        class_jaw_logits = self.class_jaw_logits(cls_feature)
+        
+        # 2. Prediction Tooth Number (conditioned on Jaw)
+        jaw_cond = self.jaw_to_tooth(torch.sigmoid(class_jaw_logits))
+        class_logits = self.class_logits(cls_feature + jaw_cond)
+        
+        # 3. Prediction Caries Status (conditioned on Jaw and Tooth)
+        tooth_jaw_combined = torch.cat([torch.sigmoid(class_logits), torch.sigmoid(class_jaw_logits)], dim=-1)
+        patho_cond = self.tooth_jaw_to_patho(tooth_jaw_combined)
+        class_patho_logits = self.class_patho_logits(cls_feature + patho_cond)
+
         bboxes_deltas = self.bboxes_delta(reg_feature)
         pred_bboxes = self.apply_deltas(bboxes_deltas, bboxes.view(-1, 4))
         
-        return class_logits.view(N, nr_boxes, -1), pred_bboxes.view(N, nr_boxes, -1), obj_features
+        return class_logits.view(N, nr_boxes, -1), class_patho_logits.view(N, nr_boxes, -1), class_jaw_logits.view(N, nr_boxes, -1), pred_bboxes.view(N, nr_boxes, -1), obj_features
 
     def apply_deltas(self, deltas, boxes):
         """
