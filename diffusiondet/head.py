@@ -264,6 +264,12 @@ class RCNNHead(nn.Module):
         if pro_features is None:
             pro_features = roi_features.view(N, nr_boxes, self.d_model, -1).mean(-1)
 
+        # Safety Check: Đảm bảo roi_features đúng kích thước dự kiến (H*W)
+        # Nếu bộ pooler của backbone trả về kích thước khác, ta force nó về đúng cấu hình
+        pooler_res = int(math.sqrt(self.inst_interact.out_layer.in_features // self.d_model))
+        if roi_features.shape[-1] != pooler_res or roi_features.shape[-2] != pooler_res:
+            roi_features = F.adaptive_avg_pool2d(roi_features, (pooler_res, pooler_res))
+
         roi_features = roi_features.view(N * nr_boxes, self.d_model, -1).permute(2, 0, 1)
 
         # self_att.
@@ -374,7 +380,7 @@ class DynamicConv(nn.Module):
         self.activation = nn.ReLU(inplace=True)
 
         pooler_resolution = cfg.MODEL.ROI_BOX_HEAD.POOLER_RESOLUTION
-        num_output = self.hidden_dim * pooler_resolution ** 2
+        num_output = self.hidden_dim * (pooler_resolution ** 2)
         self.out_layer = nn.Linear(num_output, self.hidden_dim)
         self.norm3 = nn.LayerNorm(self.hidden_dim)
 
@@ -396,6 +402,21 @@ class DynamicConv(nn.Module):
         features = torch.bmm(features, param2)
         features = self.norm2(features)
         features = self.activation(features)
+
+        # Safety Check: Ensure spatial dimension S matches out_layer expectations
+        # Expected S = self.out_layer.in_features // self.hidden_dim
+        expected_s = self.out_layer.in_features // self.hidden_dim
+        if features.shape[1] != expected_s:
+            # We assume features is (B, S, C) and we need (B, expected_s, C)
+            # Reshape to (B, C, H, W) where H*W = S
+            B, S, C = features.shape
+            H = int(math.sqrt(S))
+            W = S // H
+            target_res = int(math.sqrt(expected_s))
+            
+            x = features.transpose(1, 2).view(B, C, H, W)
+            x = F.adaptive_avg_pool2d(x, (target_res, target_res))
+            features = x.view(B, C, -1).transpose(1, 2)
 
         features = features.flatten(1)
         features = self.out_layer(features)
