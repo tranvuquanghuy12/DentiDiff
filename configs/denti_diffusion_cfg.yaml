@@ -1,0 +1,39 @@
+_BASE_: "Base-DiffusionDet.yaml"
+MODEL:
+  WEIGHTS: "detectron2://ImageNetPretrained/torchvision/R_50.pkl"
+  RESNETS:
+    DEPTH: 50
+  DIFFUSIONDET:
+    # --- CẤU HÌNH NHIỀU NHÃN CHO DENTAL ---
+    NUM_CLASSES: 16           # Cấu hình dựa trên bản 16 nhãn răng cũ
+    NUM_PATHO_CLASSES: 4      # Số lượng Bệnh lý (Thay bằng số thực tế của anh)
+    NUM_JAW_CLASSES: 2        # Số lượng Hàm (Trên/Dưới)
+    
+    # Số lượng hộp box khuếch tán. Kaggle GPU khỏe thì để 300-500. Dưới 16GB VRAM thì để 100-300
+    NUM_PROPOSALS: 300 
+    
+    # Bước tinh chỉnh mẫu trong lúc dự đoán
+    SAMPLE_STEP: 3            
+DATASETS:
+  # Cần khớp với tên anh đã register trong hàm train_net.py
+  TRAIN: ("dental_train",)
+  TEST: ("dental_val",)
+DATALOADER:
+  NUM_WORKERS: 2              # Kaggle cho tối đa 2-4 luồng CPU
+SOLVER:
+  REFRH: 0
+  IMS_PER_BATCH: 4            # CỰC QUAN TRỌNG: Batch size (Kaggle P100 RAM 16GB chỉ nên để 2 hoặc 4)
+  BASE_LR: 0.00005            # Tốc độ học nhỏ vì train lại từ đầu
+  STEPS: (20000, 24000)
+  MAX_ITER: 30000             # Số bước hội tụ
+  WARMUP_FACTOR: 0.01
+  WARMUP_ITERS: 1000
+  WEIGHT_DECAY: 0.0001
+  OPTIMIZER: "ADAMW"
+
+INPUT:
+  # Resize ngẫu nhiên cho chuẩn Kaggle để data dồi dào hơn
+  MIN_SIZE_TRAIN: (480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800)
+  MAX_SIZE_TRAIN: 1333
+  MIN_SIZE_TEST: 800
+  MAX_SIZE_TEST: 1333
