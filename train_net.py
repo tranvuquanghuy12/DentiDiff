@@ -36,6 +36,17 @@ from diffusiondet import DiffusionDetDatasetMapper, add_diffusiondet_config, Dif
 from diffusiondet.util.model_ema import add_model_ema_configs, may_build_model_ema, may_get_ema_checkpointer, EMAHook, \
     apply_model_ema_and_restore, EMADetectionCheckpointer
 
+from detectron2.data.datasets import register_coco_instances
+import os
+
+# Register custom caries dataset using environment variables for flexible paths (e.g., on Kaggle)
+try:
+    json_path = os.environ.get("CARIES_TRAIN_JSON", "datasets/caries/annotations/train_coco_hierarchical.json")
+    img_path = os.environ.get("CARIES_TRAIN_IMAGES", "datasets/caries/train/images")
+    register_coco_instances("caries_train", {}, json_path, img_path)
+except Exception as e:
+    print(f"Warning: Failed to register caries_train dataset: {e}")
+
 
 class Trainer(DefaultTrainer):
     """ Extension of the Trainer class adapted to DiffusionDet. """

@@ -116,6 +116,13 @@ class DiffusionDetDatasetMapper:
                 anno.pop("segmentation", None)
                 anno.pop("keypoints", None)
 
+            # Ensure extra keys are kept
+            extra_keys = ["patho", "jaw"]
+            for obj in dataset_dict["annotations"]:
+                for k in extra_keys:
+                    if k in obj:
+                        pass # ensure we iterate over it safely
+
             # USER: Implement additional transformations if you have other types of data
             annos = [
                 utils.transform_instance_annotations(obj, transforms, image_shape)
@@ -123,5 +130,15 @@ class DiffusionDetDatasetMapper:
                 if obj.get("iscrowd", 0) == 0
             ]
             instances = utils.annotations_to_instances(annos, image_shape)
+            
+            # Inject patho and jaw fields from annotations into the instances object
+            if "annotations" in dataset_dict and len(dataset_dict["annotations"]) > 0:
+                if "patho" in dataset_dict["annotations"][0]:
+                    patho_list = [int(obj.get("patho", 0)) for obj in dataset_dict["annotations"]]
+                    instances.gt_patho = torch.tensor(patho_list, dtype=torch.int64)
+                if "jaw" in dataset_dict["annotations"][0]:
+                    jaw_list = [int(obj.get("jaw", 0)) for obj in dataset_dict["annotations"]]
+                    instances.gt_jaw = torch.tensor(jaw_list, dtype=torch.int64)
+                    
             dataset_dict["instances"] = utils.filter_empty_instances(instances)
         return dataset_dict
