@@ -9,10 +9,26 @@ def test_model_structure():
     add_diffusiondet_config(cfg)
     # Giả lập cấu hình tối thiểu
     cfg.MODEL.DEVICE = "cpu"
-    cfg.MODEL.ROI_HEADS.IN_FEATURES = ["res2", "res3", "res4", "res5"]
     
     print("--- Đang khởi tạo mô hình DiffusionDet ---")
-    model = DiffusionDet(cfg)
+    # Khởi tạo model lần đầu để lấy thông tin backbone
+    try:
+        model = DiffusionDet(cfg)
+        
+        # Tự động lấy các tính năng mà backbone thực sự tạo ra
+        actual_features = list(model.backbone.output_shape().keys())
+        print(f"Backbone tạo ra các features: {actual_features}")
+        cfg.MODEL.ROI_HEADS.IN_FEATURES = actual_features
+        
+        # Khởi tạo lại model với config đã chuẩn hóa features
+        model = DiffusionDet(cfg)
+    except Exception as e:
+        print(f"Lỗi khi khởi tạo model: {e}")
+        # Fallback nếu không tự lấy được
+        actual_features = ["res2", "res3", "res4", "res5"]
+        cfg.MODEL.ROI_HEADS.IN_FEATURES = actual_features
+        model = DiffusionDet(cfg)
+
     model.eval()
 
     print("\n--- Kiểm tra cấu trúc DynamicHead ---")
