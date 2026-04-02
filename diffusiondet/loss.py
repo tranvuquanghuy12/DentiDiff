@@ -179,10 +179,88 @@ class SetCriterionDynamicK(nn.Module):
                 loss_jaw = torch.sum(jaw_loss) / num_boxes
 
             losses = {'loss_ce': loss_ce, 'loss_patho': loss_patho, 'loss_jaw': loss_jaw}
+            
+            # Task 4: Contrastive Loss (Lcontra)
+            if 'pred_obj' in outputs and self.cfg.MODEL.DiffusionDet.CONTRA_WEIGHT > 0:
+                losses.update(self.loss_contrastive(outputs, targets, indices))
+
         else:
             raise NotImplementedError
 
         return losses
+
+    def loss_contrastive(self, outputs, targets, indices):
+        """
+        Supervised Contrastive Loss (Lcontra)
+        Pulls features of same-class instances together, pushes different-class apart.
+        """
+        src_obj = outputs['pred_obj']  # [B, Q, C]
+        batch_size = len(targets)
+        
+        all_features = []
+        all_labels = [] # We can use tooth number (ce) as the primary class for contrast
+        
+        for batch_idx in range(batch_size):
+            valid_query = indices[batch_idx][0]
+            gt_multi_idx = indices[batch_idx][1]
+            if len(gt_multi_idx) == 0:
+                continue
+            
+            # Features that matched a GT
+            matched_feats = src_obj[batch_idx, valid_query] # [N_matched, C]
+            # Labels: combine Tooth, Patho, Jaw into a single identifier for contrast
+            # or just use one. The paper suggests hierarchical, so maybe a combo.
+            t_labels = targets[batch_idx]["labels"][gt_multi_idx]
+            p_labels = targets[batch_idx]["labels_patho"][gt_multi_idx]
+            j_labels = targets[batch_idx]["labels_jaw"][gt_multi_idx]
+            
+            # Create a unique ID for the hierarchy combination
+            # label_id = tooth * 100 + patho * 10 + jaw
+            combined_labels = t_labels * 100 + p_labels * 10 + j_labels
+            
+            all_features.append(matched_feats)
+            all_labels.append(combined_labels)
+            
+        if not all_features:
+            return {'loss_contra': src_obj.sum() * 0}
+            
+        features = torch.cat(all_features, dim=0) # [N_total_matched, C]
+        labels = torch.cat(all_labels, dim=0) # [N_total_matched]
+        
+        if features.shape[0] < 2:
+            return {'loss_contra': features.sum() * 0}
+
+        # Normalize features for cosine similarity
+        features = F.normalize(features, p=2, dim=1)
+        
+        # Similarity matrix
+        logits = torch.matmul(features, features.T) # [N, N]
+        
+        # Mask for same labels
+        labels = labels.contiguous().view(-1, 1)
+        mask = torch.eq(labels, labels.T).float().to(device=features.device)
+        
+        # Self-contrast mask (remove diagonal)
+        logits_mask = torch.scatter(
+            torch.ones_like(mask),
+            1,
+            torch.arange(features.shape[0]).view(-1, 1).to(device=features.device),
+            0
+        )
+        mask = mask * logits_mask
+        
+        # InfoNCE-like contrastive loss
+        temperature = self.cfg.MODEL.DiffusionDet.CONTRA_TEMP
+        exp_logits = torch.exp(logits / temperature) * logits_mask
+        
+        log_prob = (logits / temperature) - torch.log(exp_logits.sum(1, keepdim=True) + 1e-6)
+        
+        # Compute mean of log-likelihood over positive samples
+        mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-6)
+        
+        loss_contra = -mean_log_prob_pos.mean()
+        
+        return {'loss_contra': loss_contra}
 
     def loss_boxes(self, outputs, targets, indices, num_boxes):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
@@ -249,6 +327,7 @@ class SetCriterionDynamicK(nn.Module):
         loss_map = {
             'labels': self.loss_labels,
             'boxes': self.loss_boxes,
+            'contra': self.loss_contrastive,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)

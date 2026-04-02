@@ -5,34 +5,36 @@ MODEL:
     DEPTH: 50
   DIFFUSIONDET:
     # --- CẤU HÌNH NHIỀU NHÃN CHO DENTAL ---
-    NUM_CLASSES: 16           # Cấu hình dựa trên bản 16 nhãn răng cũ
-    NUM_PATHO_CLASSES: 4      # Số lượng Bệnh lý (Thay bằng số thực tế của anh)
-    NUM_JAW_CLASSES: 2        # Số lượng Hàm (Trên/Dưới)
+    NUM_CLASSES: 33           
+    NUM_CLASSES_PATHO: 4      
+    NUM_CLASSES_JAW: 2        
     
-    # Số lượng hộp box khuếch tán. Kaggle GPU khỏe thì để 300-500. Dưới 16GB VRAM thì để 100-300
+    # Contrastive Loss
+    CONTRA_WEIGHT: 5.0
+    CONTRA_TEMP: 0.07
+
+    # Số lượng hộp box khuếch tán
     NUM_PROPOSALS: 300 
     
     # Bước tinh chỉnh mẫu trong lúc dự đoán
-    SAMPLE_STEP: 3            
+    SAMPLE_STEP: 1            
 DATASETS:
-  # Cần khớp với tên anh đã register trong hàm train_net.py
-  TRAIN: ("dental_train",)
-  TEST: ("dental_val",)
+  TRAIN: ("caries_train",)
+  TEST: ("caries_val",)
 DATALOADER:
-  NUM_WORKERS: 2              # Kaggle cho tối đa 2-4 luồng CPU
+  NUM_WORKERS: 2              
 SOLVER:
   REFRH: 0
-  IMS_PER_BATCH: 4            # CỰC QUAN TRỌNG: Batch size (Kaggle P100 RAM 16GB chỉ nên để 2 hoặc 4)
-  BASE_LR: 0.00005            # Tốc độ học nhỏ vì train lại từ đầu
+  IMS_PER_BATCH: 4            
+  BASE_LR: 0.00005            
   STEPS: (20000, 24000)
-  MAX_ITER: 30000             # Số bước hội tụ
+  MAX_ITER: 30000             
   WARMUP_FACTOR: 0.01
   WARMUP_ITERS: 1000
   WEIGHT_DECAY: 0.0001
   OPTIMIZER: "ADAMW"
 
 INPUT:
-  # Resize ngẫu nhiên cho chuẩn Kaggle để data dồi dào hơn
   MIN_SIZE_TRAIN: (480, 512, 544, 576, 608, 640, 672, 704, 736, 768, 800)
   MAX_SIZE_TRAIN: 1333
   MIN_SIZE_TEST: 800

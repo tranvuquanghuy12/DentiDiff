@@ -156,6 +156,7 @@ class DynamicHead(nn.Module):
         inter_class_patho_logits = []
         inter_class_jaw_logits = []
         inter_pred_bboxes = []
+        inter_obj_features = []
 
         bs = len(features[0])
         bboxes = init_bboxes
@@ -168,18 +169,20 @@ class DynamicHead(nn.Module):
             proposal_features = None
         
         for head_idx, rcnn_head in enumerate(self.head_series):
-            class_logits, class_patho_logits, class_jaw_logits, pred_bboxes, proposal_features = rcnn_head(features, bboxes, proposal_features, self.box_pooler, time)
+            class_logits, class_patho_logits, class_jaw_logits, pred_bboxes, obj_features = rcnn_head(features, bboxes, proposal_features, self.box_pooler, time)
             if self.return_intermediate:
                 inter_class_logits.append(class_logits)
                 inter_class_patho_logits.append(class_patho_logits)
                 inter_class_jaw_logits.append(class_jaw_logits)
                 inter_pred_bboxes.append(pred_bboxes)
+                inter_obj_features.append(obj_features)
             bboxes = pred_bboxes.detach()
+            proposal_features = obj_features.detach()
 
         if self.return_intermediate:
-            return torch.stack(inter_class_logits), torch.stack(inter_class_patho_logits), torch.stack(inter_class_jaw_logits), torch.stack(inter_pred_bboxes)
+            return torch.stack(inter_class_logits), torch.stack(inter_class_patho_logits), torch.stack(inter_class_jaw_logits), torch.stack(inter_pred_bboxes), torch.stack(inter_obj_features)
 
-        return class_logits[None], class_patho_logits[None], class_jaw_logits[None], pred_bboxes[None]
+        return class_logits[None], class_patho_logits[None], class_jaw_logits[None], pred_bboxes[None], obj_features[None]
 
 
 class RCNNHead(nn.Module):

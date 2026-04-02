@@ -147,14 +147,23 @@ class DiffusionDet(nn.Module):
         matcher = HungarianMatcherDynamicK(
             cfg=cfg, cost_class=class_weight, cost_patho=patho_weight, cost_jaw=jaw_weight, cost_bbox=l1_weight, cost_giou=giou_weight, use_focal=self.use_focal
         )
-        weight_dict = {"loss_ce": class_weight, "loss_patho": patho_weight, "loss_jaw": jaw_weight, "loss_bbox": l1_weight, "loss_giou": giou_weight}
+        weight_dict = {
+            "loss_ce": class_weight, 
+            "loss_patho": patho_weight, 
+            "loss_jaw": jaw_weight, 
+            "loss_bbox": l1_weight, 
+            "loss_giou": giou_weight,
+            "loss_contra": cfg.MODEL.DiffusionDet.CONTRA_WEIGHT
+        }
         if self.deep_supervision:
             aux_weight_dict = {}
             for i in range(self.num_heads - 1):
-                aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
+                aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items() if k != "loss_contra"}) # Contra usually applied only on final or shared
+                # Actually, many apply to all, but let's follow standard aux logic
+                # Paper hints at a single Lcontra weight
             weight_dict.update(aux_weight_dict)
 
-        losses = ["labels", "boxes"]
+        losses = ["labels", "boxes", "contra"]
 
         self.criterion = SetCriterionDynamicK(
             cfg=cfg, num_classes=self.num_classes, num_classes_patho=self.num_classes_patho, num_classes_jaw=self.num_classes_jaw, 
@@ -177,7 +186,7 @@ class DiffusionDet(nn.Module):
         x_boxes = ((x_boxes / self.scale) + 1) / 2
         x_boxes = box_cxcywh_to_xyxy(x_boxes)
         x_boxes = x_boxes * images_whwh[:, None, :]
-        outputs_class, outputs_patho, outputs_jaw, outputs_coord = self.head(backbone_feats, x_boxes, t, None)
+        outputs_class, outputs_patho, outputs_jaw, outputs_coord, outputs_obj = self.head(backbone_feats, x_boxes, t, None)
 
         x_start = outputs_coord[-1]  # (batch, num_proposals, 4) predict boxes: absolute coordinates (x1, y1, x2, y2)
         x_start = x_start / images_whwh[:, None, :]
@@ -186,7 +195,7 @@ class DiffusionDet(nn.Module):
         x_start = torch.clamp(x_start, min=-1 * self.scale, max=self.scale)
         pred_noise = self.predict_noise_from_start(x, t, x_start)
 
-        return ModelPrediction(pred_noise, x_start), outputs_class, outputs_patho, outputs_jaw, outputs_coord
+        return ModelPrediction(pred_noise, x_start), outputs_class, outputs_patho, outputs_jaw, outputs_coord, outputs_obj
 
     @torch.no_grad()
     def ddim_sample(self, batched_inputs, backbone_feats, images_whwh, images, clip_denoised=True, do_postprocess=True):
@@ -207,8 +216,8 @@ class DiffusionDet(nn.Module):
             time_cond = torch.full((batch,), time, device=self.device, dtype=torch.long)
             self_cond = x_start if self.self_condition else None
 
-            preds, outputs_class, outputs_patho, outputs_jaw, outputs_coord = self.model_predictions(backbone_feats, images_whwh, img, time_cond,
-                                                                          self_cond, clip_x_start=clip_denoised)
+            preds, outputs_class, outputs_patho, outputs_jaw, outputs_coord, _ = self.model_predictions(backbone_feats, images_whwh, img, time_cond,
+                                                                           self_cond, clip_x_start=clip_denoised)
             pred_noise, x_start = preds.pred_noise, preds.pred_x_start
 
             if self.box_renewal:  # filter
@@ -326,12 +335,12 @@ class DiffusionDet(nn.Module):
             t = t.squeeze(-1)
             x_boxes = x_boxes * images_whwh[:, None, :]
 
-            outputs_class, outputs_patho, outputs_jaw, outputs_coord = self.head(features, x_boxes, t, None)
-            output = {'pred_logits': outputs_class[-1], 'pred_patho_logits': outputs_patho[-1], 'pred_jaw_logits': outputs_jaw[-1], 'pred_boxes': outputs_coord[-1]}
+            outputs_class, outputs_patho, outputs_jaw, outputs_coord, outputs_obj = self.head(features, x_boxes, t, None)
+            output = {'pred_logits': outputs_class[-1], 'pred_patho_logits': outputs_patho[-1], 'pred_jaw_logits': outputs_jaw[-1], 'pred_boxes': outputs_coord[-1], 'pred_obj': outputs_obj[-1]}
 
             if self.deep_supervision:
-                output['aux_outputs'] = [{'pred_logits': a, 'pred_patho_logits': ap, 'pred_jaw_logits': aj, 'pred_boxes': b}
-                                         for a, ap, aj, b in zip(outputs_class[:-1], outputs_patho[:-1], outputs_jaw[:-1], outputs_coord[:-1])]
+                output['aux_outputs'] = [{'pred_logits': a, 'pred_patho_logits': ap, 'pred_jaw_logits': aj, 'pred_boxes': b, 'pred_obj': o}
+                                         for a, ap, aj, b, o in zip(outputs_class[:-1], outputs_patho[:-1], outputs_jaw[:-1], outputs_coord[:-1], outputs_obj[:-1])]
 
             loss_dict = self.criterion(output, targets)
             weight_dict = self.criterion.weight_dict

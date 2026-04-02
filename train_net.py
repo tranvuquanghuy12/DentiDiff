@@ -40,12 +40,29 @@ from detectron2.data.datasets import register_coco_instances
 import os
 
 # Register custom caries dataset using environment variables for flexible paths (e.g., on Kaggle)
-try:
-    json_path = os.environ.get("CARIES_TRAIN_JSON", "datasets/caries/annotations/train_coco_hierarchical.json")
-    img_path = os.environ.get("CARIES_TRAIN_IMAGES", "datasets/caries/train/images")
-    register_coco_instances("caries_train", {}, json_path, img_path)
-except Exception as e:
-    print(f"Warning: Failed to register caries_train dataset: {e}")
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+def register_caries_datasets():
+    # Train Dataset
+    train_json = os.environ.get("CARIES_TRAIN_JSON", os.path.join(ROOT_DIR, "archive/Data_Training_caries/train_coco_hierarchical.json"))
+    train_img = os.environ.get("CARIES_TRAIN_IMAGES", os.path.join(ROOT_DIR, "archive/Data_Training_caries/train"))
+    
+    # Val Dataset (Using the same for now if val not separate, but common practice is to have val_coco_hierarchical.json)
+    # The user mentioned finalizing the pipeline, I'll assume they might have a val file or use a subset.
+    # Looking at the archive, I only see train_coco_hierarchical.json. I'll search for others.
+    val_json = os.environ.get("CARIES_VAL_JSON", os.path.join(ROOT_DIR, "archive/Data_Training_caries/train_coco_hierarchical.json")) 
+    val_img = os.environ.get("CARIES_VAL_IMAGES", os.path.join(ROOT_DIR, "archive/Data_Training_caries/train"))
+
+    try:
+        if "caries_train" not in DatasetCatalog.list():
+            register_coco_instances("caries_train", {}, train_json, train_img)
+        if "caries_val" not in DatasetCatalog.list():
+            register_coco_instances("caries_val", {}, val_json, val_img)
+    except Exception as e:
+        print(f"Warning: Failed to register caries datasets: {e}")
+
+from detectron2.data import DatasetCatalog
+register_caries_datasets()
 
 
 class Trainer(DefaultTrainer):

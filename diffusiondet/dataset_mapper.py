@@ -85,7 +85,28 @@ class DiffusionDetDatasetMapper:
             dict: a format that builtin models in detectron2 accept
         """
         dataset_dict = copy.deepcopy(dataset_dict)  # it will be modified by code below
-        image = utils.read_image(dataset_dict["file_name"], format=self.img_format)
+        
+        file_name = dataset_dict["file_name"]
+        import os
+        if not os.path.exists(file_name):
+            # Try fallback to project-relative path
+            # Original: C:\Users\My Computer\Downloads\Dự án TAD-AI-3\archive\Data_Training_caries\train\images\image_1.jpg
+            # We want to find image_1.jpg in our local archive folder
+            basename = os.path.basename(file_name)
+            # Find which split it belongs to based on the original path if possible, 
+            # or just try common locations
+            possible_paths = [
+                os.path.join("archive", "Data_Training_caries", "train", "images", basename),
+                os.path.join("archive", "Data_Training_caries", "val", "images", basename),
+                os.path.join("datasets", "caries", "train", "images", basename),
+                os.path.join("datasets", "caries", "val", "images", basename),
+            ]
+            for p in possible_paths:
+                if os.path.exists(p):
+                    file_name = p
+                    break
+        
+        image = utils.read_image(file_name, format=self.img_format)
         utils.check_image_size(dataset_dict, image)
 
         if self.crop_gen is None:
@@ -99,14 +120,9 @@ class DiffusionDetDatasetMapper:
                 )
 
         image_shape = image.shape[:2]  # h, w
-
-        # Pytorch's dataloader is efficient on torch.Tensor due to shared-memory,
-        # but not efficient on large generic data structures due to the use of pickle & mp.Queue.
-        # Therefore it's important to use torch.Tensor.
         dataset_dict["image"] = torch.as_tensor(np.ascontiguousarray(image.transpose(2, 0, 1)))
 
         if not self.is_train:
-            # USER: Modify this if you want to keep them for some reason.
             dataset_dict.pop("annotations", None)
             return dataset_dict
 
@@ -116,12 +132,14 @@ class DiffusionDetDatasetMapper:
                 anno.pop("segmentation", None)
                 anno.pop("keypoints", None)
 
-            # Ensure extra keys are kept
-            extra_keys = ["patho", "jaw"]
-            for obj in dataset_dict["annotations"]:
-                for k in extra_keys:
-                    if k in obj:
-                        pass # ensure we iterate over it safely
+            # Extract hierarchical labels before popping annotations
+            annos_raw = dataset_dict.get("annotations", [])
+            patho_list = []
+            jaw_list = []
+            if len(annos_raw) > 0 and "patho" in annos_raw[0]:
+                patho_list = [int(obj.get("patho", 0)) for obj in annos_raw]
+            if len(annos_raw) > 0 and "jaw" in annos_raw[0]:
+                jaw_list = [int(obj.get("jaw", 0)) for obj in annos_raw]
 
             # USER: Implement additional transformations if you have other types of data
             annos = [
@@ -131,14 +149,11 @@ class DiffusionDetDatasetMapper:
             ]
             instances = utils.annotations_to_instances(annos, image_shape)
             
-            # Inject patho and jaw fields from annotations into the instances object
-            if "annotations" in dataset_dict and len(dataset_dict["annotations"]) > 0:
-                if "patho" in dataset_dict["annotations"][0]:
-                    patho_list = [int(obj.get("patho", 0)) for obj in dataset_dict["annotations"]]
-                    instances.gt_patho = torch.tensor(patho_list, dtype=torch.int64)
-                if "jaw" in dataset_dict["annotations"][0]:
-                    jaw_list = [int(obj.get("jaw", 0)) for obj in dataset_dict["annotations"]]
-                    instances.gt_jaw = torch.tensor(jaw_list, dtype=torch.int64)
+            # Inject patho and jaw fields into instances
+            if patho_list:
+                instances.gt_patho = torch.tensor(patho_list, dtype=torch.int64)
+            if jaw_list:
+                instances.gt_jaw = torch.tensor(jaw_list, dtype=torch.int64)
                     
             dataset_dict["instances"] = utils.filter_empty_instances(instances)
         return dataset_dict
